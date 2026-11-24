@@ -212,6 +212,13 @@ select.in.warn{background-color:var(--red-l)}
 .addli .in{border-color:var(--line);background:#fff}
 .dataactions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
 
+/* account / login */
+.topr{display:flex;align-items:center;gap:14px}
+.auth{max-width:440px;margin:26px auto}
+.auth h2{font:500 36px/1.1 var(--serif);color:var(--rose);margin:0 0 6px}
+.authlinks{margin-top:16px;font-size:13px;color:var(--muted);text-align:center}
+.authlinks .linkbtn{color:var(--rose)}
+.banner.err{background:var(--red-l);border-color:#F5C6C0;color:var(--red)}
 /* toast + footer */
 #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);background:var(--ink);color:#fff;padding:11px 16px;border-radius:12px;display:flex;gap:14px;align-items:center;opacity:0;pointer-events:none;transition:.25s;z-index:20;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 #toast.show{opacity:1;transform:translateX(-50%);pointer-events:auto}
@@ -238,24 +245,28 @@ select.in.warn{background-color:var(--red-l)}
 <div class="wrap">
   <div class="top">
     <div class="brand">Unfucked Club<small>Money Dashboard</small></div>
-    <div class="saved" id="saved"><i></i><span>Saved on this device</span></div>
+    <div class="topr"><div class="saved" id="saved"><i></i><span></span></div><div id="acct"></div></div>
   </div>
   <div class="nav" id="nav"></div>
   <div id="view"></div>
   <div class="foot">
     Made with love by <b>Indy</b> ♡ · <b>Unfucked Club</b> · <a href="https://stan.store/IndySantos" target="_blank" rel="noopener" style="color:var(--rose);font-weight:600">Join the Unfucked Club waitlist →</a><br>
-    Your numbers are saved only in this browser, on this device. Download a backup now and then (Settings → Your data).<br>
+    Your numbers are saved to your own account, so they look the same on your phone and your computer. Other members can’t see them. You can download a backup any time (Settings → Your data).<br>
     Tax figures are simple estimates, not tax advice. Talk to your accountant.
   </div>
 </div>
 <div id="toast"></div>
 
+<script src="supabase.js"></script>
 <script>
 (() => {
 'use strict';
 
 /* ───────────────────────── constants ───────────────────────── */
-const STORE = 'zeny-money-dashboard-v1';
+const STORE = 'uc-money-cache';
+const LEGACY_KEY = 'zeny-money-dashboard-v1'; // numbers saved on this device before accounts existed
+const SB_URL = 'https://hywmmmvwkfddjntptaah.supabase.co';
+const SB_KEY = 'sb_publishable_icyTNiz3uF88SFyShoHN0w_fJJ590v4'; // public key: safe in the page; row-level security protects each account
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const MONTHS_LONG = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 const COLORS = ['#A0525E','#C9929B','#B8996A','#7E9166','#6E3340','#D9B8BC','#8C7A7E','#5F7A8A','#D4A373','#A8B58F'];
@@ -307,14 +318,6 @@ const fresh = () => ({
   lists: defaultLists(),
 });
 
-let storageOK = true;
-function load() {
-  try {
-    const raw = localStorage.getItem(STORE);
-    if (!raw) return fresh();
-    return normalize(JSON.parse(raw));
-  } catch (e) { storageOK = false; return fresh(); }
-}
 function normalize(s) {
   const f = fresh();
   s = s || {};
@@ -328,18 +331,168 @@ function normalize(s) {
     lists: Object.assign(f.lists, s.lists || {}),
   };
 }
-let state = load();
-let saveTimer = null;
-function save() {
-  clearTimeout(saveTimer);
-  const el = document.querySelector('#saved span');
-  if (el) el.textContent = 'Saving…';
-  saveTimer = setTimeout(() => {
-    try { localStorage.setItem(STORE, JSON.stringify(state)); }
-    catch (e) { storageOK = false; }
-    if (el) el.textContent = storageOK ? 'Saved on this device' : 'Not saving — your browser blocks it. Download a backup!';
-  }, 250);
+
+/* ───────────────────────── account + cloud saving ───────────────────────── */
+const sb = (window.supabase && window.supabase.createClient)
+  ? window.supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } })
+  : null;
+let state = fresh();
+let user = null, phase = 'loading', authMode = 'signin';   // phase: loading | auth | error | app
+let lastSynced = null, flushP = null, retryTimer = null, saveTimer = null;
+let dirtyVer = 0, savedVer = 0, gen = 0;   // gen changes on every edit/save, so an old answer from the server can never overwrite newer numbers
+const isDirty = () => dirtyVer > savedVer;
+const cacheKey = uid => STORE + '-' + uid;
+const pendKey = uid => 'uc-pending-' + uid;
+const lsGet = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+const lsDel = k => { try { localStorage.removeItem(k); } catch (e) {} };
+
+function setStatus(kind) {
+  const el = document.querySelector('#saved span'), dot = document.querySelector('#saved i');
+  if (!el) return;
+  const M = { saving: ['Saving…', 'var(--gold)'], saved: ['Saved to your account', 'var(--sage)'], offline: ['Offline — will save when you’re back', 'var(--red)'] };
+  const [t, c] = M[kind] || ['', 'transparent'];
+  el.textContent = t; dot.style.background = c;
 }
+function save() {
+  if (!user) return;
+  dirtyVer++; gen++;
+  clearTimeout(saveTimer);
+  setStatus('saving');
+  saveTimer = setTimeout(flush, 700);
+}
+function flush() {
+  if (!user || !sb) return Promise.resolve();
+  clearTimeout(saveTimer);
+  if (flushP) return flushP;
+  flushP = (async () => {
+    const uid = user.id;
+    try {
+      while (isDirty()) {
+        const v = dirtyVer;
+        lsSet(cacheKey(uid), JSON.stringify(state));
+        lsSet(pendKey(uid), '1');
+        const { data, error } = await sb.from('user_data').upsert({ user_id: uid, data: state, updated_at: new Date().toISOString() }).select('updated_at').single();
+        if (error) throw error;
+        lastSynced = data.updated_at;
+        savedVer = Math.max(savedVer, v); gen++;
+      }
+      lsDel(pendKey(uid)); lsDel(LEGACY_KEY);
+      setStatus('saved');
+    } catch (e) {
+      setStatus('offline');
+      clearTimeout(retryTimer); retryTimer = setTimeout(flush, 15000);
+    }
+  })().finally(() => { flushP = null; });
+  return flushP;
+}
+async function pull() {            // another device may have changed things: fetch the latest when you come back to the tab
+  if (!user || !sb || phase !== 'app' || isDirty() || flushP) return;
+  const g = gen;
+  const { data, error } = await sb.from('user_data').select('data, updated_at').eq('user_id', user.id).maybeSingle();
+  if (error || !data || g !== gen || data.updated_at === lastSynced || isDirty() || flushP) return;
+  state = normalize(data.data); lastSynced = data.updated_at;
+  lsSet(cacheKey(user.id), JSON.stringify(state));
+  render(); toast('Updated with your latest numbers');
+}
+async function enterApp(session) {
+  user = session.user; phase = 'loading'; render();
+  let row = null;
+  try {
+    const { data, error } = await sb.from('user_data').select('data, updated_at').eq('user_id', user.id).maybeSingle();
+    if (error) throw error;
+    row = data;
+  } catch (e) { phase = 'error'; render(); return; }          // never edit blind: we could overwrite what is saved
+  dirtyVer = savedVer = 0; lastSynced = null;
+  const cached = lsGet(cacheKey(user.id)), hadPending = lsGet(pendKey(user.id)) === '1';
+  if (row && !(hadPending && cached)) {
+    state = normalize(row.data); lastSynced = row.updated_at;
+  } else {
+    let seed = (row ? null : null);
+    try { seed = cached ? JSON.parse(cached) : (row ? null : JSON.parse(lsGet(LEGACY_KEY) || 'null')); } catch (e) { seed = null; }
+    state = seed ? normalize(seed) : (row ? normalize(row.data) : fresh());
+    dirtyVer = 1;                    // first sign-in (or unsaved edits from before): create / update the account copy now
+    flush();
+  }
+  phase = 'app'; authMode = 'signin'; render();
+  setStatus(isDirty() ? 'saving' : 'saved');
+}
+async function signOut() {
+  await flush();
+  if (isDirty() && !confirm('Your latest changes have not saved yet. Sign out anyway?')) return;
+  const uid = user && user.id;
+  clearTimeout(saveTimer); clearTimeout(retryTimer);
+  if (uid) { lsDel(cacheKey(uid)); lsDel(pendKey(uid)); }
+  await sb.auth.signOut({ scope: 'local' });   // only this device: other devices stay signed in
+}
+function friendly(err) {
+  const m = (err && err.message) || '';
+  if (/invalid login/i.test(m)) return 'That email and password don’t match. Try again, or tap “Forgot password?”.';
+  if (/rate limit|too many|security purposes|after \d+ seconds/i.test(m)) return 'Too many tries. Please wait a minute and try again.';
+  if (/password/i.test(m) && /(short|least|weak)/i.test(m)) return 'Please choose a longer password (at least 8 characters).';
+  if (/fetch|network|failed to/i.test(m)) return 'No connection. Check your internet and try again.';
+  return 'Something went wrong: ' + m;
+}
+async function doAuth(form) {
+  const btn = form.querySelector('button[type=submit]');
+  const email = ((form.elements.email || {}).value || '').trim(), pw = (form.elements.password || {}).value || '';
+  const say = (t, ok) => { const m = document.getElementById('authMsg'); if (!m) return; m.className = 'banner ' + (ok ? 'ok' : 'err'); m.style.display = 'flex'; m.textContent = t; };
+  if (authMode !== 'recover' && !/^\S+@\S+\.\S+$/.test(email)) return say('Please type a valid email.');
+  if (authMode !== 'forgot' && authMode !== 'signin' && pw.length < 8) return say('Your password needs at least 8 characters.');
+  if (authMode === 'signin' && !pw) return say('Please type your password.');
+  btn.disabled = true;
+  try {
+    if (authMode === 'signup') {
+      const { data, error } = await sb.auth.signUp({ email, password: pw });
+      if (error) {
+        if (/already|registered/i.test(error.message)) { authMode = 'signin'; render(); say('You already have an account with this email. Sign in below.'); }
+        else say(friendly(error));
+        return;
+      }
+      if (!data.session) say('Almost there! Check your email, tap the link to confirm, then sign in.', true);
+    } else if (authMode === 'signin') {
+      const { error } = await sb.auth.signInWithPassword({ email, password: pw });
+      if (error) say(friendly(error));
+    } else if (authMode === 'forgot') {
+      const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname });
+      if (error) say(friendly(error)); else say('If that email has an account, we just sent you a link. Check your inbox (and spam).', true);
+    } else if (authMode === 'recover') {
+      const { error } = await sb.auth.updateUser({ password: pw });
+      if (error) { say(friendly(error)); return; }
+      authMode = 'signin';
+      const { data: { session } } = await sb.auth.getSession();
+      if (session) { await enterApp(session); toast('Password updated'); }
+    }
+  } finally { btn.disabled = false; }
+}
+async function changePassword() {
+  const inp = document.getElementById('newPw'), pw = inp.value;
+  if (pw.length < 8) return toast('Use at least 8 characters');
+  const { error } = await sb.auth.updateUser({ password: pw });
+  if (error) return toast(friendly(error).slice(0, 80));
+  inp.value = ''; toast('Password changed');
+}
+function renderAuth() {
+  if (!sb) return `<div class="card auth"><h2>We couldn’t load your dashboard</h2><div class="cardsub">Check your internet connection and refresh the page.</div></div>`;
+  const m = authMode;
+  const T = {
+    signin: ['Welcome back', 'Sign in to see your numbers. They look the same on your phone and your computer.', 'Sign in'],
+    signup: ['Create your account', 'Use your email and a password. Your numbers are saved to your own account, so you can open them on any device.', 'Create my account'],
+    forgot: ['Reset your password', 'Type your email and we’ll send you a link to choose a new password.', 'Send me the link'],
+    recover: ['Choose a new password', 'Pick a new password for your account.', 'Save new password'],
+  }[m];
+  const emailField = m !== 'recover' ? `<label>Email<input class="in" type="email" name="email" autocomplete="email" inputmode="email" placeholder="you@email.com"></label>` : '';
+  const pwField = m !== 'forgot' ? `<label>${m === 'recover' ? 'New password' : 'Password'}<input class="in" type="password" name="password" autocomplete="${m === 'signin' ? 'current-password' : 'new-password'}" placeholder="${m === 'signin' ? 'Your password' : 'At least 8 characters'}"></label>` : '';
+  const links = m === 'signin' ? `<button type="button" class="linkbtn" data-authmode="forgot">Forgot password?</button> · <button type="button" class="linkbtn" data-authmode="signup">Create an account</button>`
+    : m === 'signup' ? `Already have an account? <button type="button" class="linkbtn" data-authmode="signin">Sign in</button>`
+    : m === 'forgot' ? `<button type="button" class="linkbtn" data-authmode="signin">Back to sign in</button>` : '';
+  return `<div class="card auth"><h2>${T[0]}</h2><div class="cardsub">${T[1]}</div>
+    <form id="authForm" novalidate><div class="form" style="grid-template-columns:1fr">${emailField}${pwField}</div>
+    <div id="authMsg" class="banner" style="display:none;margin:14px 0 0"></div>
+    <div style="margin-top:16px"><button class="btn" type="submit" style="width:100%;justify-content:center">${T[2]}</button></div></form>
+    <div class="authlinks">${links}</div></div>`;
+}
+
 
 /* ───────────────────────── helpers ───────────────────────── */
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -769,8 +922,12 @@ function renderSettings() {
   <div class="card set"><h3>Categories &amp; lists</h3>
     <div class="cardsub" style="margin:0">Rename, add or remove anything. Renaming updates your existing rows automatically.</div>
     <div class="lists">${listEditor('incomeTypes', 'Income types', true)}${listEditor('businessCats', 'Business categories')}${listEditor('personalCats', 'Personal categories')}${listEditor('methods', 'Payment methods')}</div></div>
+  <div class="card set"><h3>Your account</h3>
+    <div class="cardsub" style="margin:0">Signed in as <b>${esc(user ? user.email : '')}</b>. Your numbers are saved to this account, so you see the same thing on your phone and your computer.</div>
+    <div class="form"><label>Change your password<input class="in" type="password" id="newPw" autocomplete="new-password" placeholder="At least 8 characters"></label></div>
+    <div class="dataactions"><button class="btn" data-chpw>Change password</button><button class="btn ghost" data-signout>Sign out</button></div></div>
   <div class="card set"><h3>Your data</h3>
-    <div class="cardsub" style="margin:0">Your numbers live in this browser on this device — nobody else can see them. Download a backup to keep a copy or to move to another device.</div>
+    <div class="cardsub" style="margin:0">Your numbers are saved to your account. Download a backup any time if you want a copy of your own.</div>
     <div class="dataactions">
       <button class="btn" data-backup>${icon('download', 16)} Download backup</button>
       <label class="btn ghost" style="cursor:pointer">${icon('upload', 16)} Restore backup<input type="file" id="restoreFile" accept="application/json,.json" hidden></label>
@@ -790,8 +947,18 @@ function go(t) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 function render() {
-  document.getElementById('nav').innerHTML = NAV.map(([k, l]) => `<button class="${k === tab ? 'on' : ''}" data-go="${k}">${l}</button>`).join('');
+  const inApp = phase === 'app' && user && authMode !== 'recover';
+  document.getElementById('acct').innerHTML = inApp ? '<button class="linkbtn" data-signout style="color:var(--muted);font-size:12px;text-decoration:none">Sign out</button>' : '';
+  document.getElementById('saved').style.display = inApp ? '' : 'none';
   const v = document.getElementById('view');
+  if (!inApp) {
+    document.getElementById('nav').innerHTML = '';
+    v.innerHTML = phase === 'loading' ? '<div class="card auth"><div class="empty" style="text-align:center">Loading your numbers…</div></div>'
+      : phase === 'error' ? '<div class="card auth"><h2>Can’t reach your account</h2><div class="cardsub">Check your internet connection and try again. Your numbers are safe.</div><button class="btn" data-retryload>Try again</button></div>'
+      : renderAuth();
+    return;
+  }
+  document.getElementById('nav').innerHTML = NAV.map(([k, l]) => `<button class="${k === tab ? 'on' : ''}" data-go="${k}">${l}</button>`).join('');
   v.innerHTML = tab === 'dashboard' ? renderDashboard() : tab === 'goals' ? renderGoals() : tab === 'settings' ? renderSettings() : renderTab(tab);
 }
 
@@ -909,6 +1076,10 @@ document.addEventListener('click', e => {
   const b = e.target.closest('button, [data-go]');
   if (!b) return;
   const d = b.dataset;
+  if (d.authmode) { authMode = d.authmode; render(); return; }
+  if (d.signout !== undefined) return signOut();
+  if (d.chpw !== undefined) return changePassword();
+  if (d.retryload !== undefined) { sb.auth.getSession().then(({ data }) => data.session ? enterApp(data.session) : (phase = 'auth', render())); return; }
   if (d.go) return go(d.go);
   if (d.add) {
     const kind = d.add;
@@ -961,7 +1132,7 @@ document.addEventListener('click', e => {
   }
   if (d.backup !== undefined) { download(`money-dashboard-backup-${todayISO()}.json`, JSON.stringify(state, null, 2), 'application/json'); toast('Backup downloaded'); return; }
   if (d.reset !== undefined) {
-    if (!confirm('Delete ALL your data from this browser? Download a backup first if you might want it back.')) return;
+    if (!confirm('Delete ALL your numbers? This also clears them from your account. Download a backup first if you might want them back.')) return;
     state = fresh(); save(); go('dashboard'); return;
   }
 });
@@ -1011,8 +1182,21 @@ document.addEventListener('change', e => {
 });
 window.addEventListener('hashchange', () => { const t = (location.hash || '#dashboard').slice(1); if (NAV.some(n => n[0] === t) && t !== tab) { tab = t; render(); } });
 
+document.addEventListener('submit', e => { if (e.target.id === 'authForm') { e.preventDefault(); doAuth(e.target); } });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { if (isDirty()) flush(); } else pull(); });
+window.addEventListener('online', () => { if (isDirty()) flush(); else pull(); });
+if (sb) {
+  sb.auth.onAuthStateChange((event, session) => {
+    if (event === 'PASSWORD_RECOVERY') { authMode = 'recover'; render(); return; }
+    if (event === 'SIGNED_OUT') { user = null; state = fresh(); dirtyVer = savedVer = 0; lastSynced = null; phase = 'auth'; authMode = 'signin'; render(); return; }
+    if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN') {
+      if (session) { if (!user || user.id !== session.user.id) setTimeout(() => enterApp(session), 0); }
+      else if (event === 'INITIAL_SESSION') { phase = 'auth'; render(); }
+    }
+  });
+  setTimeout(() => { if (phase === 'loading' && !user) { phase = 'auth'; render(); } }, 8000);
+} else { phase = 'auth'; }
 render();
-if (!storageOK) document.querySelector('#saved span').textContent = 'Not saving — your browser blocks it. Download a backup!';
 })();
 </script>
 </body>
